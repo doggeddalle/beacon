@@ -160,5 +160,6 @@ NAS is never overwhelmed. See the package doc comments for details.
 
 ## License
 
-No license is specified; all rights reserved. Add a `LICENSE` file if you intend
-to distribute.
+Licensed under the Apache License, Version 2.0 — see [`LICENSE`](LICENSE).
+
+Copyright 2026 doggeddalle
