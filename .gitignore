@@ -1,0 +1,25 @@
+# Build output (anchored to repo root so they don't match cmd/beacon/, etc.)
+/dist/
+/beacon
+/beacon.exe
+/beacon-arm64
+*.apkg
+*.apk
+# Generated packaging asset
+/packaging/apkg/CONTROL/icon.png
+
+# Runtime state (never commit a real config or the database)
+/beacon.toml
+/data/
+*.log
+*.db
+*.db-shm
+*.db-wal
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

@@ -1,0 +1,17 @@
+# Normalise all text files to LF in the repository. The target is Linux, and
+# the shell scripts (start-stop.sh, beaconctl.sh, post-install.sh) MUST stay LF
+# or they break on the NAS. PowerShell handles LF fine on Windows too.
+* text=auto eol=lf
+
+*.sh   text eol=lf
+*.go   text eol=lf
+*.toml text eol=lf
+*.json text eol=lf
+*.xml  text eol=lf
+*.html text eol=lf
+*.md   text eol=lf
+
+# Binary assets
+*.png binary
+*.apk binary
+*.apkg binary

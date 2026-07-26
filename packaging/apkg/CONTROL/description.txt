@@ -1,0 +1,7 @@
+Beacon is a lightweight, self-updating DLNA / UPnP-AV media server. It streams
+the videos, music and photos on your NAS to smart TVs and other DLNA players on
+your local network, and keeps its library up to date automatically as files are
+added, changed or removed — no manual rescans, no nightly database rebuilds.
+
+Features: real-time library updates, metadata (duration/resolution) and sidecar
+subtitles, video thumbnails, and a built-in web admin dashboard.

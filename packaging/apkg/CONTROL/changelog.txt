@@ -1,0 +1,5 @@
+0.7.0
+- First App Central package for ASUSTOR ADM (arm64).
+- Self-updating DLNA media server: real-time watcher + periodic reconcile.
+- Metadata (ffprobe), sidecar subtitles, lazy cached thumbnails (ffmpeg).
+- Web admin dashboard at the app's port (default 8322).

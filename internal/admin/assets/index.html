@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Beacon</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --card: #fff; --fg: #1a1d21; --muted: #6b7280;
+    --border: #e5e7eb; --accent: #2563eb; --ok: #16a34a; --off: #9ca3af;
+    --danger: #dc2626; --code-bg: #0f172a; --code-fg: #cbd5e1;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1216; --card: #171b21; --fg: #e5e7eb; --muted: #9099a6;
+      --border: #262c35; --accent: #3b82f6; --code-bg: #0b0e13; --code-fg: #b8c2d0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 24px 16px 64px; }
+  header { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin-bottom: 4px; }
+  h1 { font-size: 24px; margin: 0; letter-spacing: -0.02em; }
+  h1 .beam { color: var(--accent); }
+  .sub { color: var(--muted); font-size: 13px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 28px 0 10px; }
+  .card { background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+  .stat { text-align: center; }
+  .stat .n { font-size: 30px; font-weight: 650; letter-spacing: -0.02em; }
+  .stat .l { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .badges { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+  .badge { display: inline-flex; align-items: center; gap: 6px; font-size: 13px;
+    padding: 4px 10px; border-radius: 999px; border: 1px solid var(--border); background: var(--bg); }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--off); }
+  .dot.on { background: var(--ok); }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .row:last-child { border-bottom: none; }
+  .row .path { color: var(--muted); font-size: 13px; word-break: break-all; }
+  button { font: inherit; cursor: pointer; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--card); color: var(--fg); padding: 7px 14px; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.link { border: none; background: none; color: var(--danger); padding: 4px 8px; }
+  input { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: var(--bg); color: var(--fg); }
+  .addform { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+  .addform input[name=path] { flex: 1 1 260px; }
+  pre#logs { background: var(--code-bg); color: var(--code-fg); border-radius: 12px;
+    padding: 14px; overflow: auto; max-height: 340px; font-size: 12.5px; line-height: 1.55;
+    white-space: pre-wrap; word-break: break-word; margin: 0; }
+  .toolbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .msg { font-size: 13px; color: var(--muted); }
+  .msg.err { color: var(--danger); }
+  .spin { display: inline-block; width: 10px; height: 10px; border-radius: 50%;
+    border: 2px solid var(--accent); border-top-color: transparent; animation: sp 0.8s linear infinite; }
+  @keyframes sp { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1><span class="beam">◈</span> Beacon</h1>
+    <span class="sub" id="hdr">connecting…</span>
+  </header>
+
+  <h2>Library</h2>
+  <div class="card">
+    <div class="grid">
+      <div class="stat"><div class="n" id="libsize">–</div><div class="l">items indexed</div></div>
+      <div class="stat"><div class="n" id="foldercount">–</div><div class="l">folders</div></div>
+    </div>
+    <div class="badges" id="badges"></div>
+  </div>
+
+  <h2>Watched folders</h2>
+  <div class="card">
+    <div id="folders"></div>
+    <div class="addform">
+      <input name="name" id="fname" placeholder="Name (optional)" size="14">
+      <input name="path" id="fpath" placeholder="/volume1/kodi/movies">
+      <button class="primary" id="addbtn">Add folder</button>
+    </div>
+    <div class="msg" id="foldermsg"></div>
+  </div>
+
+  <h2>Maintenance</h2>
+  <div class="card">
+    <div class="toolbar">
+      <button id="rescanbtn">Rescan library now</button>
+      <span class="msg" id="rescanmsg"></span>
+    </div>
+  </div>
+
+  <h2>Recent activity</h2>
+  <pre id="logs">loading…</pre>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const fmtDur = s => { s = Math.floor(s); const d=Math.floor(s/86400), h=Math.floor(s%86400/3600), m=Math.floor(s%3600/60);
+  if (d) return d+"d "+h+"h"; if (h) return h+"h "+m+"m"; if (m) return m+"m"; return s+"s"; };
+
+function badge(label, on) {
+  return `<span class="badge"><span class="dot ${on?'on':''}"></span>${label}</span>`;
+}
+
+async function refreshStatus() {
+  try {
+    const s = await (await fetch('admin/api/status')).json();
+    $('#hdr').textContent = `v${s.version} · ${s.httpAddr} · up ${fmtDur(s.uptimeSeconds)}`;
+    $('#libsize').textContent = s.librarySize;
+    $('#foldercount').textContent = s.folders.length;
+    $('#badges').innerHTML =
+      badge(s.watcherActive ? 'Watcher live' : 'Watcher off', s.watcherActive) +
+      badge('ffprobe (metadata)', s.ffprobe) +
+      badge('ffmpeg (thumbnails)', s.ffmpeg) +
+      (s.scanning ? `<span class="badge"><span class="spin"></span> scanning…</span>` : '');
+    renderFolders(s.folders);
+  } catch (e) { $('#hdr').textContent = 'disconnected — is Beacon running?'; }
+}
+
+function renderFolders(folders) {
+  const el = $('#folders');
+  if (!folders.length) { el.innerHTML = '<div class="msg">No folders configured yet — add one below.</div>'; return; }
+  el.innerHTML = folders.map(f =>
+    `<div class="row"><div><strong>${esc(f.name)}</strong><div class="path">${esc(f.path)}</div></div>
+     <button class="link" data-path="${esc(f.path)}">Remove</button></div>`).join('');
+  el.querySelectorAll('button.link').forEach(b => b.onclick = () => removeFolder(b.dataset.path));
+}
+
+function esc(s){ return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+
+async function addFolder() {
+  const name = $('#fname').value, path = $('#fpath').value;
+  $('#foldermsg').className = 'msg'; $('#foldermsg').textContent = 'adding…';
+  const r = await fetch('admin/api/folders', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ name, path }) });
+  const j = await r.json();
+  if (!r.ok) { $('#foldermsg').className = 'msg err'; $('#foldermsg').textContent = j.error || 'failed'; return; }
+  $('#fname').value=''; $('#fpath').value=''; $('#foldermsg').textContent = 'added — indexing…';
+  refreshStatus();
+}
+
+async function removeFolder(path) {
+  if (!confirm('Remove this folder from the library?\n' + path)) return;
+  const r = await fetch('admin/api/folders?path=' + encodeURIComponent(path), { method:'DELETE' });
+  const j = await r.json();
+  if (!r.ok) { $('#foldermsg').className = 'msg err'; $('#foldermsg').textContent = j.error || 'failed'; return; }
+  refreshStatus();
+}
+
+async function rescan() {
+  $('#rescanmsg').textContent = 'rescan started…';
+  await fetch('admin/api/rescan', { method:'POST' });
+  setTimeout(() => { $('#rescanmsg').textContent = ''; refreshStatus(); }, 1500);
+}
+
+async function refreshLogs() {
+  try {
+    const j = await (await fetch('admin/api/logs')).json();
+    const el = $('#logs'); const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 20;
+    el.textContent = (j.lines || []).join('\n');
+    if (atBottom) el.scrollTop = el.scrollHeight;
+  } catch (e) {}
+}
+
+$('#addbtn').onclick = addFolder;
+$('#rescanbtn').onclick = rescan;
+$('#fpath').addEventListener('keydown', e => { if (e.key === 'Enter') addFolder(); });
+
+refreshStatus(); refreshLogs();
+setInterval(refreshStatus, 3000);
+setInterval(refreshLogs, 4000);
+</script>
+</body>
+</html>

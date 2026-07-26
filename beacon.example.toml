@@ -1,0 +1,41 @@
+# Beacon configuration example.
+# Copy to beacon.toml and edit. Every field is optional — omitted fields use
+# built-in defaults. On first run a stable server UUID is generated and saved.
+
+[server]
+friendly_name = "Beacon"   # shown to DLNA clients (e.g. on your TV)
+# uuid = ""                # auto-generated on first run; leave empty
+# interface = ""           # bind IP; empty = auto-detect primary LAN address
+http_port = 8322           # media, SOAP control and the admin dashboard
+                           # (avoid 8200 — that's MiniDLNA's default and is
+                           #  usually taken by the NAS's built-in media server;
+                           #  use 0 to auto-pick any free port)
+data_dir = "./data"        # SQLite DB, thumbnails and other state
+
+# Add one block per media source. Repeat [[library.folders]] as needed.
+[[library.folders]]
+name = "Movies"
+path = "/volume1/kodi/movies"
+
+# [[library.folders]]
+# name = "Music"
+# path = "/volume1/Music"
+
+[index]
+workers = 2                    # concurrent probe/thumbnail jobs (keep low on 1GB RAM)
+reconcile_interval = "15m"     # Tier-2 periodic delta scan
+integrity_interval = "24h"     # Tier-3 deep verify (use "0s" to disable)
+write_settle_delay = "3s"      # wait for a file's size to stop changing before indexing
+
+[meta]
+# Paths to ffprobe (metadata) and ffmpeg (thumbnails). Empty = auto-detect
+# (looks next to the beacon binary, then on PATH). Without ffprobe, durations
+# and resolutions are blank but sidecar subtitles still work. Without ffmpeg,
+# thumbnails are disabled but sidecar/folder poster images are still used.
+ffprobe_path = ""
+ffmpeg_path = ""
+thumbnail_width = 320          # generated thumbnail width in px (height scales)
+
+[log]
+level = "info"   # debug | info | warn | error
+format = "text"  # text | json
