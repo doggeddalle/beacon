@@ -12,11 +12,17 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Version = "0.7.1"
+    # Defaults to the contents of the repo's VERSION file, the single source of
+    # truth. It used to be hardcoded here and drifted from the README, the
+    # changelog and deploy.ps1, which all claimed different versions.
+    [string]$Version
 )
 
 $ErrorActionPreference = "Stop"
 $repo = Split-Path -Parent $PSScriptRoot
+if (-not $Version) {
+    $Version = (Get-Content (Join-Path $repo "VERSION") -Raw).Trim()
+}
 Push-Location $repo
 try {
     if (-not (Get-Command go -ErrorAction SilentlyContinue)) {

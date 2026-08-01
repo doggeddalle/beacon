@@ -16,15 +16,15 @@ const (
 const (
 	PathDeviceDesc = "/rootDesc.xml"
 
-	PathSCPDContentDir  = "/scpd/ContentDirectory.xml"
-	PathCtlContentDir   = "/ctl/ContentDirectory"
-	PathEvtContentDir   = "/evt/ContentDirectory"
-	PathSCPDConnMgr     = "/scpd/ConnectionManager.xml"
-	PathCtlConnMgr      = "/ctl/ConnectionManager"
-	PathEvtConnMgr      = "/evt/ConnectionManager"
-	PathMediaPrefix     = "/media/"    // + object ID
-	PathSubtitlePrefix  = "/subtitle/" // + object ID
-	PathThumbPrefix     = "/thumb/"    // + object ID
+	PathSCPDContentDir = "/scpd/ContentDirectory.xml"
+	PathCtlContentDir  = "/ctl/ContentDirectory"
+	PathEvtContentDir  = "/evt/ContentDirectory"
+	PathSCPDConnMgr    = "/scpd/ConnectionManager.xml"
+	PathCtlConnMgr     = "/ctl/ConnectionManager"
+	PathEvtConnMgr     = "/evt/ConnectionManager"
+	PathMediaPrefix    = "/media/"    // + object ID
+	PathSubtitlePrefix = "/subtitle/" // + object ID
+	PathThumbPrefix    = "/thumb/"    // + object ID
 )
 
 //go:embed xml/ContentDirectory.xml

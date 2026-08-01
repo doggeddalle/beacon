@@ -26,22 +26,22 @@ type mediaInfo struct {
 // extTable maps lower-case file extensions (with dot) to their media info.
 var extTable = map[string]mediaInfo{
 	// Video
-	".mp4":   {kindVideo, "object.item.videoItem", "video/mp4"},
-	".m4v":   {kindVideo, "object.item.videoItem", "video/mp4"},
-	".mkv":   {kindVideo, "object.item.videoItem", "video/x-matroska"},
-	".avi":   {kindVideo, "object.item.videoItem", "video/x-msvideo"},
-	".mov":   {kindVideo, "object.item.videoItem", "video/quicktime"},
-	".wmv":   {kindVideo, "object.item.videoItem", "video/x-ms-wmv"},
-	".mpg":   {kindVideo, "object.item.videoItem", "video/mpeg"},
-	".mpeg":  {kindVideo, "object.item.videoItem", "video/mpeg"},
-	".ts":    {kindVideo, "object.item.videoItem", "video/mp2t"},
-	".m2ts":  {kindVideo, "object.item.videoItem", "video/mp2t"},
-	".mts":   {kindVideo, "object.item.videoItem", "video/mp2t"},
-	".flv":   {kindVideo, "object.item.videoItem", "video/x-flv"},
-	".webm":  {kindVideo, "object.item.videoItem", "video/webm"},
-	".vob":   {kindVideo, "object.item.videoItem", "video/mpeg"},
-	".3gp":   {kindVideo, "object.item.videoItem", "video/3gpp"},
-	".divx":  {kindVideo, "object.item.videoItem", "video/x-msvideo"},
+	".mp4":  {kindVideo, "object.item.videoItem", "video/mp4"},
+	".m4v":  {kindVideo, "object.item.videoItem", "video/mp4"},
+	".mkv":  {kindVideo, "object.item.videoItem", "video/x-matroska"},
+	".avi":  {kindVideo, "object.item.videoItem", "video/x-msvideo"},
+	".mov":  {kindVideo, "object.item.videoItem", "video/quicktime"},
+	".wmv":  {kindVideo, "object.item.videoItem", "video/x-ms-wmv"},
+	".mpg":  {kindVideo, "object.item.videoItem", "video/mpeg"},
+	".mpeg": {kindVideo, "object.item.videoItem", "video/mpeg"},
+	".ts":   {kindVideo, "object.item.videoItem", "video/mp2t"},
+	".m2ts": {kindVideo, "object.item.videoItem", "video/mp2t"},
+	".mts":  {kindVideo, "object.item.videoItem", "video/mp2t"},
+	".flv":  {kindVideo, "object.item.videoItem", "video/x-flv"},
+	".webm": {kindVideo, "object.item.videoItem", "video/webm"},
+	".vob":  {kindVideo, "object.item.videoItem", "video/mpeg"},
+	".3gp":  {kindVideo, "object.item.videoItem", "video/3gpp"},
+	".divx": {kindVideo, "object.item.videoItem", "video/x-msvideo"},
 
 	// Audio
 	".mp3":  {kindAudio, "object.item.audioItem.musicTrack", "audio/mpeg"},
@@ -86,16 +86,42 @@ func lookupMedia(name string) (mediaInfo, bool) {
 	return info, ok
 }
 
-// DLNAFlags advertises that byte-range seeking is supported (OP=01) and the
-// stream is not transcoded (CI=0). Our HTTP server honours ranges, which is
-// what makes scrubbing work on smart TVs. Also used as the value of the
-// `contentFeatures.dlna.org` HTTP header when serving media.
+// DLNAFlags is the contentFeatures value for streamed media (audio and video):
+// byte-range seeking supported (OP=01), not transcoded (CI=0), and the
+// TM_S|TM_B|HTTP_STALLING|DLNA_V15 flag word.
 const DLNAFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;" +
 	"DLNA.ORG_FLAGS=01700000000000000000000000000000"
 
+// imageDLNAFlags is the contentFeatures value for still images: TM_I|TM_B.
+//
+// Images must advertise TM_I (interactive, 0x00800000), not TM_S. The single
+// streaming constant above used to be applied to every kind, so a renderer that
+// honours the transfer-mode bits would refuse to fetch photos as interactive
+// content.
+const imageDLNAFlags = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;" +
+	"DLNA.ORG_FLAGS=00D00000000000000000000000000000"
+
+// ContentFeatures returns the contentFeatures.dlna.org value for a MIME type.
+func ContentFeatures(mime string) string {
+	if isImageMime(mime) {
+		return imageDLNAFlags
+	}
+	return DLNAFlags
+}
+
+// TransferModeFor returns the DLNA transfer mode a MIME type should default to.
+func TransferModeFor(mime string) string {
+	if isImageMime(mime) {
+		return "Interactive"
+	}
+	return "Streaming"
+}
+
+func isImageMime(mime string) bool { return strings.HasPrefix(mime, "image/") }
+
 // dlnaProtocolInfo builds the `res@protocolInfo` string for a MIME type.
 func dlnaProtocolInfo(mime string) string {
-	return "http-get:*:" + mime + ":" + DLNAFlags
+	return "http-get:*:" + mime + ":" + ContentFeatures(mime)
 }
 
 // MimeType returns the MIME type for a media filename and whether it is a

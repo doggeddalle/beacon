@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"beacon/internal/content"
@@ -88,10 +89,32 @@ func (h *Handler) routes() {
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }
 
 func (h *Handler) serveXML(doc []byte) http.HandlerFunc {
+	// Content-Length is explicit because both SCPD documents are over 3 KB, past
+	// the point where Go falls back to chunked transfer-encoding — which several
+	// older TV DLNA stacks cannot parse.
+	length := strconv.Itoa(len(doc))
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", `text/xml; charset="utf-8"`)
+		w.Header().Set("Content-Length", length)
 		_, _ = w.Write(doc)
 	}
+}
+
+// setDLNAHeaders writes the transfer-mode and content-features headers a DLNA
+// renderer expects on a media, subtitle or artwork response.
+//
+// contentFeatures is sent unconditionally rather than only when the client sets
+// getcontentFeatures.dlna.org: the spec allows either, but many renderers read
+// the header without ever asking for it. Subtitle and artwork responses
+// previously carried neither header, and several Samsung firmwares silently drop
+// a subtitle track whose response does not include them.
+func setDLNAHeaders(w http.ResponseWriter, r *http.Request, mime, defaultMode string) {
+	if tm := r.Header.Get("transferMode.dlna.org"); tm != "" {
+		w.Header().Set("transferMode.dlna.org", tm) // echo what the client asked for
+	} else {
+		w.Header().Set("transferMode.dlna.org", defaultMode)
+	}
+	w.Header().Set("contentFeatures.dlna.org", content.ContentFeatures(mime))
 }
 
 func (h *Handler) serveContentDirControl(w http.ResponseWriter, r *http.Request) {
@@ -137,19 +160,11 @@ func (h *Handler) serveMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if mime, ok := content.MimeType(fi.Name()); ok {
+	mime, _ := content.MimeType(fi.Name())
+	if mime != "" {
 		w.Header().Set("Content-Type", mime)
 	}
-	// DLNA streaming headers. transferMode is echoed from the request, or
-	// defaults per media kind; contentFeatures advertises seek support.
-	if tm := r.Header.Get("transferMode.dlna.org"); tm != "" {
-		w.Header().Set("transferMode.dlna.org", tm)
-	} else {
-		w.Header().Set("transferMode.dlna.org", "Streaming")
-	}
-	if r.Header.Get("getcontentFeatures.dlna.org") == "1" {
-		w.Header().Set("contentFeatures.dlna.org", content.DLNAFlags)
-	}
+	setDLNAHeaders(w, r, mime, content.TransferModeFor(mime))
 
 	// http.ServeContent handles Range requests, If-Modified-Since, HEAD and the
 	// Accept-Ranges header — everything needed for smooth seeking.
@@ -178,7 +193,11 @@ func (h *Handler) serveSubtitle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "cannot stat subtitle", http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Type", subtitleMime(kind))
+	subMime := subtitleMime(kind)
+	w.Header().Set("Content-Type", subMime)
+	// Samsung fetches subtitles with getcontentFeatures.dlna.org: 1 and expects
+	// the DLNA headers back; without them the track is silently ignored.
+	setDLNAHeaders(w, r, subMime, "Interactive")
 	http.ServeContent(w, r, filepath.Base(path), fi.ModTime(), f)
 }
 
@@ -206,6 +225,8 @@ func (h *Handler) serveThumb(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", ctype)
 	w.Header().Set("Cache-Control", "max-age=86400")
+	// Artwork is fetched interactively, not streamed.
+	setDLNAHeaders(w, r, ctype, "Interactive")
 	http.ServeContent(w, r, filepath.Base(path), fi.ModTime(), f)
 }
 

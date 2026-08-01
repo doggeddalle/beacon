@@ -51,6 +51,72 @@ func PrimaryIPv4(iface string) (net.IP, error) {
 	return nil, fmt.Errorf("no suitable IPv4 interface found")
 }
 
+// MulticastInterfaces returns the interfaces SSDP should operate on: up,
+// multicast-capable, non-loopback, and carrying an IPv4 address.
+//
+// SSDP must be present on every one of them. Joining the group on a single
+// default interface — which is what net.ListenMulticastUDP with a nil interface
+// does — silently loses discovery on a NAS with link aggregation, VLANs, or
+// Docker bridges, because the kernel's default may not be the one the TVs are on.
+//
+// If filter is non-empty it selects a single interface by name or by one of its
+// IP addresses.
+func MulticastInterfaces(filter string) ([]net.Interface, error) {
+	all, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	wantIP := net.ParseIP(filter)
+
+	var out []net.Interface
+	for _, ni := range all {
+		if ni.Flags&net.FlagUp == 0 ||
+			ni.Flags&net.FlagMulticast == 0 ||
+			ni.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		ip := firstIPv4(&ni)
+		if ip == nil {
+			continue
+		}
+		switch {
+		case filter == "":
+		case wantIP != nil:
+			if !interfaceHasIP(&ni, wantIP) {
+				continue
+			}
+		default:
+			if ni.Name != filter {
+				continue
+			}
+		}
+		out = append(out, ni)
+	}
+	if len(out) == 0 {
+		if filter != "" {
+			return nil, fmt.Errorf("no up, multicast-capable IPv4 interface matches %q", filter)
+		}
+		return nil, fmt.Errorf("no up, multicast-capable IPv4 interface found")
+	}
+	return out, nil
+}
+
+// InterfaceIPv4 returns an interface's first usable IPv4 address.
+func InterfaceIPv4(ni *net.Interface) net.IP { return firstIPv4(ni) }
+
+func interfaceHasIP(ni *net.Interface, want net.IP) bool {
+	addrs, err := ni.Addrs()
+	if err != nil {
+		return false
+	}
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && n.IP.Equal(want) {
+			return true
+		}
+	}
+	return false
+}
+
 func firstIPv4(ni *net.Interface) net.IP {
 	addrs, err := ni.Addrs()
 	if err != nil {

@@ -72,6 +72,12 @@ type Folder struct {
 // LibraryConfig lists the media sources to index.
 type LibraryConfig struct {
 	Folders []Folder `toml:"folders"`
+	// AllowedParents confines which directories the dashboard may add. The
+	// dashboard is unauthenticated, so without this any LAN peer could add "/"
+	// and stream every file on the NAS. Empty means "the parents of the folders
+	// already configured", which keeps existing setups working while still
+	// refusing arbitrary paths.
+	AllowedParents []string `toml:"allowed_parents"`
 }
 
 // IndexConfig tunes the three-tier auto-update engine.
@@ -181,7 +187,49 @@ func (c *Config) normalize() (changed bool, err error) {
 			c.Library.Folders[i].Name = filepath.Base(c.Library.Folders[i].Path)
 		}
 	}
+	for i, p := range c.Library.AllowedParents {
+		if abs, err := filepath.Abs(p); err == nil {
+			c.Library.AllowedParents[i] = abs
+		}
+	}
 	return changed, nil
+}
+
+// PathAllowed reports whether the dashboard may add path to the library.
+//
+// With no explicit allow-list the parents of the already-configured folders are
+// used, so an existing install keeps working but a request for an unrelated part
+// of the filesystem is still refused.
+func (c *Config) PathAllowed(abs string) bool {
+	for _, root := range c.allowedRoots() {
+		if abs == root || isSubPath(root, abs) {
+			return true
+		}
+	}
+	return false
+}
+
+// allowedRoots is the effective allow-list.
+func (c *Config) allowedRoots() []string {
+	if len(c.Library.AllowedParents) > 0 {
+		return c.Library.AllowedParents
+	}
+	roots := make([]string, 0, len(c.Library.Folders))
+	for _, f := range c.Library.Folders {
+		if parent := filepath.Dir(f.Path); parent != "" {
+			roots = append(roots, parent)
+		}
+	}
+	return roots
+}
+
+// AllowedRootsDescription renders the allow-list for an error message.
+func (c *Config) AllowedRootsDescription() string {
+	roots := c.allowedRoots()
+	if len(roots) == 0 {
+		return "(none configured — set library.allowed_parents in the config file)"
+	}
+	return strings.Join(roots, ", ")
 }
 
 // Validate checks the config for values that would prevent the server running.
@@ -203,17 +251,95 @@ func (c *Config) Validate() error {
 	default:
 		return fmt.Errorf("log.format %q must be text or json", c.Log.Format)
 	}
-	seen := map[string]bool{}
+	if strings.TrimSpace(c.Server.FriendlyName) == "" {
+		return fmt.Errorf("server.friendly_name must not be empty — it is the name TVs show")
+	}
+	// Empty is fine: normalize() generates one before this runs. A non-empty but
+	// malformed value is not — it is interpolated straight into the device
+	// description as "uuid:<value>".
+	if u := strings.TrimSpace(c.Server.UUID); u != "" && !validUUID(u) {
+		return fmt.Errorf("server.uuid %q is not a valid UUID (expected 8-4-4-4-12 hex digits); "+
+			"leave it empty to have one generated", c.Server.UUID)
+	}
+	// A negative interval silently disabled the tier instead of being rejected.
+	// Zero is meaningful ("disabled"), negative never is.
+	if c.Index.ReconcileInterval < 0 {
+		return fmt.Errorf("index.reconcile_interval must not be negative, got %s", c.Index.ReconcileInterval)
+	}
+	if c.Index.IntegrityInterval < 0 {
+		return fmt.Errorf("index.integrity_interval must not be negative, got %s", c.Index.IntegrityInterval)
+	}
+	if c.Index.WriteSettleDelay < 0 {
+		return fmt.Errorf("index.write_settle_delay must not be negative, got %s", c.Index.WriteSettleDelay)
+	}
+
+	seenPath := map[string]bool{}
+	seenName := map[string]bool{}
 	for _, f := range c.Library.Folders {
 		if f.Path == "" {
 			return fmt.Errorf("library folder %q has empty path", f.Name)
 		}
-		if seen[f.Path] {
+		if seenPath[f.Path] {
 			return fmt.Errorf("library folder path %q listed more than once", f.Path)
 		}
-		seen[f.Path] = true
+		seenPath[f.Path] = true
+
+		// Stale-row pruning keys on the folder name, so two folders sharing one
+		// name delete each other's rows on every scan, forever.
+		if seenName[f.Name] {
+			return fmt.Errorf("two library folders are both named %q — names must be unique, "+
+				"because the index prunes stale entries per folder name", f.Name)
+		}
+		seenName[f.Name] = true
+	}
+
+	// Nested roots index the same files twice under two names, so each scan prunes
+	// the other's rows and both duplicate all the ffprobe work.
+	for _, a := range c.Library.Folders {
+		for _, b := range c.Library.Folders {
+			if a.Path == b.Path {
+				continue
+			}
+			if isSubPath(a.Path, b.Path) {
+				return fmt.Errorf("library folder %q (%s) is inside %q (%s) — "+
+					"nested folders index the same files twice; keep only the outer one",
+					b.Name, b.Path, a.Name, a.Path)
+			}
+		}
 	}
 	return nil
+}
+
+// isSubPath reports whether child lies beneath parent.
+func isSubPath(parent, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// validUUID reports whether s is 8-4-4-4-12 hex digits. The value is interpolated
+// straight into the device description as "uuid:<s>", so a stray "<" would emit
+// malformed XML to every client.
+func validUUID(s string) bool {
+	groups := [...]int{8, 4, 4, 4, 12}
+	parts := strings.Split(s, "-")
+	if len(parts) != len(groups) {
+		return false
+	}
+	for i, p := range parts {
+		if len(p) != groups[i] {
+			return false
+		}
+		for _, r := range p {
+			isHex := (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F')
+			if !isHex {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // Save writes the config back to its file as TOML.

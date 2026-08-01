@@ -45,7 +45,7 @@ func TestWatcherRealtimeChanges(t *testing.T) {
 	}
 
 	var changes atomic.Int32
-	w := NewWatcher(st, roots, 80*time.Millisecond, discardLog(), func() { changes.Add(1) })
+	w := NewWatcher(st, roots, 80*time.Millisecond, discardLog(), func() { changes.Add(1) }, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -107,4 +107,91 @@ func TestWatcherRealtimeChanges(t *testing.T) {
 	if _, err := st.Get(filepath.Join(movies, "Existing.mp4")); err != nil {
 		t.Error("pre-existing file was lost during watch activity")
 	}
+}
+
+// Pending settle timers must not survive the watcher. They used to fire after
+// Server.Run had closed the database, writing to a closed handle and logging a
+// burst of failures on every shutdown.
+func TestWatcherStopsSettleTimersOnShutdown(t *testing.T) {
+	dir := t.TempDir()
+	movies := filepath.Join(dir, "movies")
+	if err := os.MkdirAll(movies, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Open(filepath.Join(dir, "beacon.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	roots := []Root{{Name: "Movies", Path: movies}}
+	// A long settle delay guarantees the timer is still pending at shutdown.
+	w := NewWatcher(st, roots, 10*time.Second, discardLog(), nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); _ = w.Run(ctx) }()
+	time.Sleep(300 * time.Millisecond)
+
+	write(t, filepath.Join(movies, "Pending.mp4"))
+	waitFor(t, func() bool {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		return len(w.timers) > 0
+	}, 4*time.Second, "a settle timer to be armed")
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("watcher did not stop")
+	}
+
+	w.mu.Lock()
+	n := len(w.timers)
+	w.mu.Unlock()
+	if n != 0 {
+		t.Errorf("%d settle timers still armed after shutdown — they would fire against a closed store", n)
+	}
+}
+
+// A directory that is renamed away must release the watches on its descendants,
+// not just on itself.
+func TestWatcherReleasesDescendantWatches(t *testing.T) {
+	dir := t.TempDir()
+	movies := filepath.Join(dir, "movies")
+	nested := filepath.Join(movies, "Show", "Season 1")
+	if err := os.MkdirAll(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := store.Open(filepath.Join(dir, "beacon.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+
+	roots := []Root{{Name: "Movies", Path: movies}}
+	w := NewWatcher(st, roots, 80*time.Millisecond, discardLog(), nil, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = w.Run(ctx) }()
+	time.Sleep(300 * time.Millisecond)
+
+	watchedCount := func() int {
+		w.wmu.Lock()
+		defer w.wmu.Unlock()
+		return len(w.watched)
+	}
+	if watchedCount() < 3 { // movies, Show, Season 1
+		t.Fatalf("expected watches on the nested tree, got %d", watchedCount())
+	}
+
+	if err := os.RemoveAll(filepath.Join(movies, "Show")); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, func() bool { return watchedCount() == 1 }, 4*time.Second,
+		"descendant watches to be released, leaving only the root")
 }

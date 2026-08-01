@@ -23,13 +23,18 @@ func (s *Server) Status() admin.Status {
 	integrity := s.cfg.Index.IntegrityInterval.String()
 	s.mu.Unlock()
 
-	size, _ := s.store.Count()
+	degraded := false
+	if w := s.watcher.Load(); w != nil {
+		degraded = w.Degraded()
+	}
+
 	return admin.Status{
 		Version:           s.version,
 		HTTPAddr:          s.addr,
-		LibrarySize:       size,
+		LibrarySize:       s.librarySize(),
 		Folders:           folders,
 		WatcherActive:     s.watcherActive.Load(),
+		WatcherDegraded:   degraded,
 		FFprobe:           s.prober.Available(),
 		FFmpeg:            s.thumbs.Available(),
 		ReconcileInterval: reconcile,
@@ -39,10 +44,39 @@ func (s *Server) Status() admin.Status {
 	}
 }
 
+// countTTL bounds how stale the dashboard's library size may be. The dashboard
+// polls status every 3s per open tab, and COUNT(*) over items is a full scan —
+// on a 100k-item library that was 20 table scans a minute, per tab, forever.
+const countTTL = 10 * time.Second
+
+// librarySize returns the indexed item count, recomputed at most once per
+// countTTL.
+func (s *Server) librarySize() int {
+	s.countMu.Lock()
+	defer s.countMu.Unlock()
+	if time.Since(s.countAt) < countTTL {
+		return s.countVal
+	}
+	n, err := s.store.Count()
+	if err != nil {
+		return s.countVal // keep the last good value rather than reporting zero
+	}
+	s.countVal, s.countAt = n, time.Now()
+	return n
+}
+
+// invalidateCount forces the next librarySize call to re-query. Called when the
+// library is known to have changed.
+func (s *Server) invalidateCount() {
+	s.countMu.Lock()
+	s.countAt = time.Time{}
+	s.countMu.Unlock()
+}
+
 // Rescan triggers a background full scan.
 func (s *Server) Rescan() {
 	if s.rootCtx != nil {
-		go s.runScan(s.rootCtx)
+		s.goTracked(func() { s.runScan(s.rootCtx) })
 	}
 }
 
@@ -66,8 +100,23 @@ func (s *Server) AddFolder(name, path string) error {
 		s.log.Warn("add folder rejected (not a directory)", "path", fmt.Sprintf("%q", abs))
 		return fmt.Errorf("not a directory: %s", abs)
 	}
+	// Resolve symlinks before the confinement check, or a link inside an allowed
+	// directory could point anywhere on the NAS.
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
 
 	s.mu.Lock()
+	// The dashboard is unauthenticated, so an unconfined add would let any LAN
+	// peer index and stream the entire filesystem.
+	if !s.cfg.PathAllowed(abs) {
+		allowed := s.cfg.AllowedRootsDescription()
+		s.mu.Unlock()
+		s.log.Warn("add folder rejected (outside the allowed roots)",
+			"path", fmt.Sprintf("%q", abs), "allowed", allowed)
+		return fmt.Errorf("path is outside the allowed library roots (%s); "+
+			"add it to library.allowed_parents in the config file to permit it", allowed)
+	}
 	for _, f := range s.cfg.Library.Folders {
 		if f.Path == abs {
 			s.mu.Unlock()

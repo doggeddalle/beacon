@@ -1,10 +1,13 @@
-// Package content provides the browsable media tree that backs the UPnP
-// ContentDirectory service. Phase 1 implements it directly over the filesystem
-// (see fstree.go); a later phase swaps in a SQLite-backed implementation with
-// the same Backend interface.
+// Package content defines the browsable media tree that backs the UPnP
+// ContentDirectory service: the object model, the object-ID scheme, the
+// media-type tables, and the Backend interface an implementation must satisfy.
+// The production implementation is library.Backend, over SQLite.
 package content
 
 import "context"
+
+// RootID is the ContentDirectory root container, "0" by UPnP convention.
+const RootID = "0"
 
 // Object is a single node in the browse tree — either a container (folder) or a
 // playable item (a media file). IDs are opaque strings; "0" is always the root
@@ -32,6 +35,9 @@ type Object struct {
 	// ArtworkID, if set, is the object ID used to fetch a thumbnail/poster
 	// image over HTTP. Empty means no artwork is advertised.
 	ArtworkID string
+	// ArtworkMime is the content type the artwork will be served as. Defaults to
+	// image/jpeg when empty; set it so the advertised <res> matches the bytes.
+	ArtworkMime string
 }
 
 // Resource describes one way to fetch a media item. Phase 1 emits exactly one
@@ -51,13 +57,24 @@ type Resource struct {
 	Resolution string
 }
 
+// Page selects a window of a container's children. It exists so paging happens
+// in the backend's query rather than by slicing a fully-loaded folder — a large
+// directory should cost the same to browse as a small one.
+type Page struct {
+	Offset int  // rows to skip
+	Limit  int  // maximum rows to return; <= 0 means no limit
+	Desc   bool // reverse the alphabetical order
+}
+
 // Backend is the browsable content source. Implementations must be safe for
 // concurrent use.
 type Backend interface {
 	// Object returns metadata for a single object (BrowseMetadata).
 	Object(id string) (Object, error)
-	// Children returns the direct children of a container (BrowseDirectChildren).
-	Children(id string) ([]Object, error)
+	// Children returns one page of a container's direct children
+	// (BrowseDirectChildren) along with the total number of children, which the
+	// UPnP response reports as TotalMatches.
+	Children(id string, page Page) (objs []Object, total int, err error)
 	// FilePath resolves a media object ID to an absolute filesystem path for
 	// streaming. It must reject any ID that escapes the configured roots.
 	FilePath(id string) (string, error)

@@ -48,28 +48,36 @@ func (b *Backend) Object(id string) (content.Object, error) {
 	if err != nil {
 		return content.Object{}, err
 	}
-	return b.toObject(it), nil
+	childCount := 0
+	if it.IsDir {
+		childCount, _ = b.store.CountChildren(it.Path)
+	}
+	return b.toObject(it, childCount), nil
 }
 
 // Children implements content.Backend.
-func (b *Backend) Children(id string) ([]content.Object, error) {
+func (b *Backend) Children(id string, page content.Page) ([]content.Object, int, error) {
 	parent := store.RootParent
 	if id != content.RootID {
 		p, err := content.DecodeID(id)
 		if err != nil {
-			return nil, fmt.Errorf("library: bad id %q: %w", id, err)
+			return nil, 0, fmt.Errorf("library: bad id %q: %w", id, err)
 		}
 		parent = p
 	}
-	items, err := b.store.Children(parent)
+	total, err := b.store.CountChildren(parent)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	out := make([]content.Object, 0, len(items))
-	for _, it := range items {
-		out = append(out, b.toObject(it))
+	rows, err := b.store.Children(parent, page.Offset, page.Limit, page.Desc)
+	if err != nil {
+		return nil, 0, err
 	}
-	return out, nil
+	out := make([]content.Object, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, b.toObject(r.Item, r.ChildCount))
+	}
+	return out, total, nil
 }
 
 // FilePath implements content.Backend. Only paths present in the index resolve,
@@ -89,8 +97,9 @@ func (b *Backend) FilePath(id string) (string, error) {
 	return it.Path, nil
 }
 
-// toObject converts a stored item into a UPnP content object.
-func (b *Backend) toObject(it store.Item) content.Object {
+// toObject converts a stored item into a UPnP content object. childCount comes
+// from the caller so a listing does not issue one COUNT per container.
+func (b *Backend) toObject(it store.Item, childCount int) content.Object {
 	parentID := content.RootID
 	if it.Parent != store.RootParent {
 		parentID = content.EncodeID(it.Parent)
@@ -98,14 +107,13 @@ func (b *Backend) toObject(it store.Item) content.Object {
 	id := content.EncodeID(it.Path)
 
 	if it.IsDir {
-		n, _ := b.store.CountChildren(it.Path)
 		return content.Object{
 			ID:          id,
 			ParentID:    parentID,
 			Title:       it.Name,
 			Class:       "object.container.storageFolder",
 			IsContainer: true,
-			ChildCount:  n,
+			ChildCount:  childCount,
 		}
 	}
 
@@ -133,12 +141,23 @@ func (b *Backend) toObject(it store.Item) content.Object {
 		obj.SubtitleKind = meta.KindForPath(it.SubPath)
 	}
 	// Advertise artwork for videos (frame thumbnail) and for anything with a
-	// sidecar/folder poster. Generation is lazy, in Artwork().
+	// known sidecar/folder poster. Generation is lazy, in Artwork().
+	//
+	// A generated frame needs ffmpeg; without it only a real poster file counts,
+	// otherwise every video advertises an albumArtURI that 404s.
+	//
+	// The poster path is read from the row, recorded once by the enricher. Probing
+	// the filesystem here meant an os.ReadDir per item per browse: a 2000-track
+	// folder did 2000 directory reads every time a client opened it.
 	if b.thumbs != nil {
-		if strings.Contains(it.Class, "videoItem") {
+		switch {
+		case it.ArtPath != "":
+			// A real poster wins, and it may be a PNG.
 			obj.ArtworkID = id
-		} else if _, ok := thumbs.FindPoster(it.Path); ok {
+			obj.ArtworkMime = posterMime(it.ArtPath)
+		case b.thumbs.Available() && strings.Contains(it.Class, "videoItem"):
 			obj.ArtworkID = id
+			obj.ArtworkMime = "image/jpeg" // ffmpeg-generated frame
 		}
 	}
 	return obj

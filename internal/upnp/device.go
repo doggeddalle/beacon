@@ -22,13 +22,13 @@ var deviceDescTmpl = template.Must(template.New("desc").Parse(
 <root xmlns="urn:schemas-upnp-org:device-1-0" xmlns:dlna="urn:schemas-dlna-org:device-1-0">
   <specVersion><major>1</major><minor>0</minor></specVersion>
   <device>
-    <dlna:X_DLNADOC xmlns:dlna="urn:schemas-dlna-org:device-1-0">DMS-1.50</dlna:X_DLNADOC>
     <deviceType>{{.DeviceType}}</deviceType>
     <friendlyName>{{.Info.FriendlyName}}</friendlyName>
     <manufacturer>{{.Info.Manufacturer}}</manufacturer>
     <modelName>{{.Info.ModelName}}</modelName>
     <modelNumber>{{.Info.ModelNumber}}</modelNumber>
     <UDN>{{.Info.UDN}}</UDN>
+    <dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>
     <serviceList>
       <service>
         <serviceType>{{.CDType}}</serviceType>
@@ -45,17 +45,24 @@ var deviceDescTmpl = template.Must(template.New("desc").Parse(
         <eventSubURL>{{.CMEvt}}</eventSubURL>
       </service>
     </serviceList>
+    <presentationURL>/</presentationURL>
   </device>
 </root>
 `))
 
 // deviceDescription renders the device description XML for the given identity.
 func deviceDescription(info DeviceInfo) ([]byte, error) {
-	// text/template does not escape XML, so escape the one user-supplied field.
+	// text/template does not escape XML. Every field here is interpolated
+	// verbatim, and UDN in particular comes from user-editable config, so all of
+	// them are escaped rather than just the friendly name.
 	info.FriendlyName = escapeXML(info.FriendlyName)
+	info.UDN = escapeXML(info.UDN)
+	info.Manufacturer = escapeXML(info.Manufacturer)
+	info.ModelName = escapeXML(info.ModelName)
+	info.ModelNumber = escapeXML(info.ModelNumber)
 	data := struct {
-		Info       DeviceInfo
-		DeviceType string
+		Info                               DeviceInfo
+		DeviceType                         string
 		CDType, CDID, CDSCPD, CDCtl, CDEvt string
 		CMType, CMID, CMSCPD, CMCtl, CMEvt string
 	}{

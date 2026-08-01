@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,9 +50,16 @@ type Server struct {
 
 	startTime time.Time
 
+	workers sync.WaitGroup // background goroutines that touch the store
+
+	countMu  sync.Mutex // guards the cached dashboard library size
+	countVal int
+	countAt  time.Time
+
 	mu            sync.Mutex // guards cfg.Library.Folders and the watcher lifecycle
 	rootCtx       context.Context
 	watcherCancel context.CancelFunc
+	watcher       atomic.Pointer[library.Watcher]
 	watcherActive atomic.Bool
 	scanning      atomic.Bool
 }
@@ -100,11 +108,31 @@ func New(cfg *config.Config, log *slog.Logger, logRing *logging.Ring, version st
 	cd := upnpHandler.ContentDirectory()
 
 	prober := meta.NewProber(cfg.Meta.FFprobePath)
+	// Items whose probe failed while ffprobe was missing or broken are re-queued
+	// once it is available again, so installing ffmpeg after the fact fills in the
+	// durations that were previously left blank.
+	if prober.Available() {
+		if n, err := st.ResetFailedProbes(); err != nil {
+			log.Warn("could not re-queue failed probes", "err", err)
+		} else if n > 0 {
+			log.Info("re-queued items for metadata probing", "count", n)
+		}
+	}
 	enricher := library.NewEnricher(st, prober, cfg.Index.Workers, log, func() {
 		cd.BumpUpdateID()
 	})
 
-	addr := net.JoinHostPort(ip.String(), strconv.Itoa(cfg.Server.HTTPPort))
+	// Bind every interface unless one was configured explicitly.
+	//
+	// Binding a single detected address made the server unreachable from any
+	// other subnet on a multi-homed NAS, and left the socket bound to an address
+	// the host no longer owned after a DHCP renewal. Media URLs are already built
+	// per-request from r.Host, so nothing downstream depends on the bind address.
+	bindHost := ""
+	if cfg.Server.Interface != "" {
+		bindHost = ip.String()
+	}
+	addr := net.JoinHostPort(bindHost, strconv.Itoa(cfg.Server.HTTPPort))
 	ln, err := net.Listen("tcp4", addr)
 	if err != nil {
 		st.Close()
@@ -113,14 +141,20 @@ func New(cfg *config.Config, log *slog.Logger, logRing *logging.Ring, version st
 			"  media server defaults to 8200. Change server.http_port in the config to a\n"+
 			"  free port (e.g. 8322), or disable the other server", addr, err)
 	}
-	actualAddr := ln.Addr().String()
+	port := ln.Addr().(*net.TCPAddr).Port
+	// The address shown to the user and used for log links; SSDP advertises the
+	// right per-interface address itself.
+	displayAddr := net.JoinHostPort(ip.String(), strconv.Itoa(port))
 
 	ssdpSrv, err := ssdp.New(ssdp.Config{
-		UDN:        info.UDN,
-		DeviceType: upnp.DeviceType,
-		Services:   []string{upnp.ServiceContentDirectory, upnp.ServiceConnectionManager},
-		Location:   "http://" + actualAddr + upnp.PathDeviceDesc,
-		Logger:     log,
+		UDN:          info.UDN,
+		DeviceType:   upnp.DeviceType,
+		Services:     []string{upnp.ServiceContentDirectory, upnp.ServiceConnectionManager},
+		LocationPath: upnp.PathDeviceDesc,
+		HTTPPort:     port,
+		Interface:    cfg.Server.Interface,
+		ServerString: serverString(version),
+		Logger:       log,
 	})
 	if err != nil {
 		ln.Close()
@@ -130,7 +164,7 @@ func New(cfg *config.Config, log *slog.Logger, logRing *logging.Ring, version st
 
 	s := &Server{
 		cfg: cfg, log: log, logRing: logRing, version: version,
-		ln: ln, ssdp: ssdpSrv, addr: actualAddr,
+		ln: ln, ssdp: ssdpSrv, addr: displayAddr,
 		store: st, indexer: indexer, enricher: enricher, prober: prober, thumbs: tn, cd: cd,
 		startTime: time.Now(),
 	}
@@ -139,12 +173,39 @@ func New(cfg *config.Config, log *slog.Logger, logRing *logging.Ring, version st
 	// routes "/" and "/admin/*" to it and everything else to the UPnP handler.
 	adminHandler := admin.New(s, log)
 	s.http = &http.Server{
-		Handler:      rootHandler(upnpHandler, adminHandler),
+		Handler:      withServerHeader(rootHandler(upnpHandler, adminHandler), serverString(version)),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 0, // media streams can be long-lived
 		IdleTimeout:  60 * time.Second,
 	}
 	return s, nil
+}
+
+// serverString is the SERVER header advertised over SSDP and HTTP. DLNA expects
+// "<OS>/<ver> UPnP/1.0 <product>/<ver>"; it was previously a hardcoded constant
+// that still read "Beacon/0.1" several releases later.
+func serverString(version string) string {
+	return fmt.Sprintf("%s/%s UPnP/1.0 Beacon/%s", osName(), osVersion(), version)
+}
+
+func osName() string {
+	if runtime.GOOS == "linux" {
+		return "Linux"
+	}
+	return runtime.GOOS
+}
+
+// osVersion is intentionally coarse: clients only match on the shape.
+func osVersion() string { return "1.0" }
+
+// withServerHeader stamps the DLNA SERVER header on every response. The
+// guidelines require a DMS to identify itself this way, and Go sends no SERVER
+// header of its own.
+func withServerHeader(next http.Handler, server string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Server", server)
+		next.ServeHTTP(w, r)
+	})
 }
 
 // rootHandler dispatches the dashboard/API vs. the DLNA endpoints.
@@ -170,17 +231,19 @@ func (s *Server) Run(ctx context.Context) error {
 	)
 
 	// Auto-update engine: enricher + initial scan + Tier-1 watcher, plus the
-	// periodic Tier-2/Tier-3 scans.
-	go s.enricher.Run(ctx)
-	go func() {
+	// periodic Tier-2/Tier-3 scans. Every one of these touches the store, so they
+	// are tracked and waited on before it closes.
+	s.goTracked(func() { s.enricher.Run(ctx) })
+	s.goTracked(func() {
 		s.log.Info("starting initial library scan")
 		s.runScan(ctx)
 		if ctx.Err() == nil {
 			s.startWatcher(ctx)
+			s.sweepThumbs()
 		}
-	}()
-	go s.runPeriodicScan(ctx, s.cfg.Index.ReconcileInterval.D(), "reconcile (tier 2)")
-	go s.runPeriodicScan(ctx, s.cfg.Index.IntegrityInterval.D(), "integrity (tier 3)")
+	})
+	s.goTracked(func() { s.runPeriodicScan(ctx, s.cfg.Index.ReconcileInterval.D(), "reconcile (tier 2)") })
+	s.goTracked(func() { s.runPeriodicScan(ctx, s.cfg.Index.IntegrityInterval.D(), "integrity (tier 3)") })
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -188,21 +251,60 @@ func (s *Server) Run(ctx context.Context) error {
 			errCh <- fmt.Errorf("http: %w", err)
 		}
 	}()
+
+	// SSDP is waited on separately: its byebye is sent during shutdown, and if the
+	// process exits first every client keeps a stale entry for up to max-age.
+	ssdpDone := make(chan struct{})
 	go func() {
+		defer close(ssdpDone)
 		if err := s.ssdp.Run(ctx); err != nil {
 			s.log.Error("ssdp discovery unavailable — TVs may not auto-find the server", "err", err)
 		}
 	}()
 
+	var runErr error
 	select {
 	case <-ctx.Done():
 	case err := <-errCh:
 		s.log.Error("server error", "err", err)
-		s.shutdownHTTP()
-		return err
+		runErr = err
 	}
+
 	s.shutdownHTTP()
-	return nil
+	s.waitForWorkers(ssdpDone)
+	return runErr
+}
+
+// goTracked runs fn in a goroutine the shutdown path will wait for.
+func (s *Server) goTracked(fn func()) {
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		fn()
+	}()
+}
+
+// waitForWorkers blocks until the background workers have stopped, so the store
+// is only closed once nothing is still writing to it.
+//
+// Without this the deferred store.Close() in Run raced the enricher mid-batch and
+// the indexer mid-walk, producing "database is closed" errors on every shutdown.
+func (s *Server) waitForWorkers(ssdpDone <-chan struct{}) {
+	// The watcher runs under its own cancellable context, derived from the root
+	// context, so cancelling the root already told it to stop.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.workers.Wait()
+		<-ssdpDone
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(shutdownGrace):
+		s.log.Warn("background workers did not stop in time; closing the database anyway",
+			"grace", shutdownGrace.String())
+	}
 }
 
 // runScan performs one non-destructive full scan, guarded so scans never
@@ -215,6 +317,7 @@ func (s *Server) runScan(ctx context.Context) {
 	if err := s.indexer.FullScan(ctx); err != nil && ctx.Err() == nil {
 		s.log.Warn("library scan failed", "err", err)
 	}
+	s.invalidateCount()
 	s.enricher.Kick()
 	s.cd.BumpUpdateID()
 }
@@ -236,6 +339,21 @@ func (s *Server) runPeriodicScan(ctx context.Context, interval time.Duration, la
 	}
 }
 
+// Thumbnail cache limits. Keys include the source mtime, so every edit orphans
+// the previous file and nothing else ever reclaims them — on ADM the cache sits
+// on the small system partition.
+const (
+	thumbCacheMaxAge   = 60 * 24 * time.Hour
+	thumbCacheMaxBytes = 256 << 20 // 256 MiB
+)
+
+// sweepThumbs reclaims orphaned and stale thumbnails.
+func (s *Server) sweepThumbs() {
+	if removed, freed := s.thumbs.Sweep(thumbCacheMaxAge, thumbCacheMaxBytes); removed > 0 {
+		s.log.Info("swept thumbnail cache", "removed", removed, "freed_bytes", freed)
+	}
+}
+
 // startWatcher stops any running watcher and starts a fresh one over the
 // current folder set (called at startup and whenever folders change).
 func (s *Server) startWatcher(parent context.Context) {
@@ -248,12 +366,19 @@ func (s *Server) startWatcher(parent context.Context) {
 	roots := foldersToRoots(s.cfg.Library.Folders)
 	s.mu.Unlock()
 
-	w := library.NewWatcher(s.store, roots, s.cfg.Index.WriteSettleDelay.D(), s.log, func() {
-		s.cd.BumpUpdateID()
-		s.enricher.Kick()
-	})
+	w := library.NewWatcher(s.store, roots, s.cfg.Index.WriteSettleDelay.D(), s.log,
+		func() { // a change was applied
+			s.invalidateCount()
+			s.cd.BumpUpdateID()
+			s.enricher.Kick()
+		},
+		func() { // events were lost; only a rescan can restore accuracy
+			s.goTracked(func() { s.runScan(wctx) })
+		},
+	)
+	s.watcher.Store(w)
 	s.watcherActive.Store(true)
-	go func() {
+	s.goTracked(func() {
 		err := w.Run(wctx)
 		if wctx.Err() == nil { // exited on its own (not a reload/shutdown)
 			s.watcherActive.Store(false)
@@ -261,8 +386,13 @@ func (s *Server) startWatcher(parent context.Context) {
 				s.log.Error("real-time watcher stopped — periodic scans still run", "err", err)
 			}
 		}
-	}()
+	})
 }
+
+// shutdownGrace bounds how long shutdown waits for background workers. A scan
+// mid-walk stops promptly on context cancellation; this only guards against a
+// worker wedged on unresponsive storage.
+const shutdownGrace = 10 * time.Second
 
 func (s *Server) shutdownHTTP() {
 	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

@@ -37,7 +37,7 @@ func FindSubtitle(mediaPath string) (path, kind string) {
 			continue
 		}
 		low := strings.ToLower(e.Name())
-		if !strings.HasPrefix(low, lowBase) {
+		if !hasTaggedPrefix(low, lowBase) {
 			continue
 		}
 		for _, ext := range subtitleExts {
@@ -47,6 +47,28 @@ func FindSubtitle(mediaPath string) (path, kind string) {
 		}
 	}
 	return "", ""
+}
+
+// tagSeparators are the characters that may join a media basename to a subtitle
+// tag, as in "Movie.en.srt" or "Movie-forced.srt".
+const tagSeparators = ".-_"
+
+// hasTaggedPrefix reports whether name is base followed by a tag, e.g.
+// "movie.en.srt" for base "movie".
+//
+// A bare strings.HasPrefix over-matches: "Movie 2.en.srt" starts with "Movie",
+// so a folder holding Movie.mp4 and Movie 2.mp4 would serve Movie 2's subtitles
+// with Movie. Requiring a separator keeps sequels, "S01E01" vs "S01E01v2", and
+// "Part1" vs "Part10" apart.
+func hasTaggedPrefix(name, base string) bool {
+	if !strings.HasPrefix(name, base) {
+		return false
+	}
+	rest := name[len(base):]
+	if rest == "" {
+		return false // the media file itself, not a sidecar
+	}
+	return strings.ContainsRune(tagSeparators, rune(rest[0]))
 }
 
 // KindForPath returns the subtitle kind for a subtitle file path.

@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync/atomic"
 
 	"beacon/internal/content"
@@ -90,20 +91,19 @@ func (cd *ContentDirectory) browse(w http.ResponseWriter, body []byte, resURL, s
 		cd.writeBrowse(w, didl, 1, 1, updateID)
 
 	case "BrowseDirectChildren":
-		children, err := cd.backend.Children(args.ObjectID)
+		page := pageFor(args)
+		children, total, err := cd.backend.Children(args.ObjectID, page)
 		if err != nil {
 			cd.log.Warn("browse children failed", "object", args.ObjectID, "err", err)
 			writeFault(w, 701, "No such object")
 			return
 		}
-		total := len(children)
-		page := paginate(children, args.StartingIndex, args.RequestedCount)
-		didl, err := buildDIDL(page, resURL, subURL, artURL)
+		didl, err := buildDIDL(children, resURL, subURL, artURL)
 		if err != nil {
 			writeFault(w, 501, "Action Failed")
 			return
 		}
-		cd.writeBrowse(w, didl, len(page), total, updateID)
+		cd.writeBrowse(w, didl, len(children), total, updateID)
 
 	default:
 		writeFault(w, 402, "Invalid Args")
@@ -119,18 +119,39 @@ func (cd *ContentDirectory) writeBrowse(w http.ResponseWriter, didl string, retu
 	})
 }
 
-// paginate applies UPnP StartingIndex/RequestedCount semantics. A RequestedCount
-// of 0 means "all remaining from StartingIndex".
-func paginate(objs []content.Object, start, count int) []content.Object {
-	if start < 0 {
-		start = 0
+// maxPageSize caps how many objects one Browse can return.
+//
+// UPnP says RequestedCount=0 means "all remaining", and VLC, Windows Explorer and
+// several TVs send exactly that. Honouring it literally on a 20k-item folder
+// builds a multi-megabyte DIDL document in memory, which a 512 MB NAS cannot
+// afford. Clients page correctly off TotalMatches, so capping is safe.
+const maxPageSize = 500
+
+// pageFor maps UPnP StartingIndex/RequestedCount/SortCriteria onto a backend page.
+func pageFor(args browseArgs) content.Page {
+	limit := args.RequestedCount
+	if limit <= 0 || limit > maxPageSize {
+		limit = maxPageSize
 	}
-	if start >= len(objs) {
-		return nil
+	return content.Page{
+		Offset: max(args.StartingIndex, 0),
+		Limit:  limit,
+		Desc:   sortDescending(args.SortCriteria),
 	}
-	end := len(objs)
-	if count > 0 && start+count < end {
-		end = start + count
+}
+
+// sortDescending interprets a SortCriteria list. Only dc:title is advertised in
+// GetSortCapabilities, so only its direction is honoured; anything else keeps the
+// default ascending order.
+//
+// The field was previously parsed and then ignored entirely, so a client asking
+// for "-dc:title" silently got ascending results.
+func sortDescending(criteria string) bool {
+	for _, c := range strings.Split(criteria, ",") {
+		c = strings.TrimSpace(c)
+		if strings.EqualFold(strings.TrimPrefix(c, "-"), "dc:title") {
+			return strings.HasPrefix(c, "-")
+		}
 	}
-	return objs[start:end]
+	return false
 }

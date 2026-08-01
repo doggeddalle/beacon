@@ -34,12 +34,12 @@ type didlContainer struct {
 }
 
 type didlItem struct {
-	ID         string    `xml:"id,attr"`
-	ParentID   string    `xml:"parentID,attr"`
-	Restricted int       `xml:"restricted,attr"`
-	Title      string    `xml:"dc:title"`
-	Class      string    `xml:"upnp:class"`
-	Date       string    `xml:"dc:date,omitempty"`
+	ID         string        `xml:"id,attr"`
+	ParentID   string        `xml:"parentID,attr"`
+	Restricted int           `xml:"restricted,attr"`
+	Title      string        `xml:"dc:title"`
+	Class      string        `xml:"upnp:class"`
+	Date       string        `xml:"dc:date,omitempty"`
 	AlbumArt   *didlAlbumArt `xml:"upnp:albumArtURI"`
 	Res        []didlRes     `xml:"res"`
 	// Subtitle metadata (three flavours for broad smart-TV compatibility).
@@ -70,6 +70,16 @@ type didlRes struct {
 // resURLFunc turns a media ID into an absolute streaming URL for the requesting
 // client (host-dependent, so supplied per request).
 type resURLFunc func(mediaID string) string
+
+// artworkProfile returns the DLNA profile ID to advertise for an artwork image.
+// Only JPEG has a profile worth claiming here; PNG artwork is advertised
+// unprofiled rather than mislabelled.
+func artworkProfile(mime string) string {
+	if mime == "image/jpeg" {
+		return "JPEG_SM"
+	}
+	return ""
+}
 
 // subtitleMime maps a subtitle kind to its DLNA MIME type.
 func subtitleMime(kind string) string {
@@ -128,9 +138,26 @@ func buildDIDL(objs []content.Object, resURL, subURL, artURL resURLFunc) (string
 		}
 		if o.ArtworkID != "" {
 			artwork := artURL(o.ArtworkID)
-			item.AlbumArt = &didlAlbumArt{ProfileID: "JPEG_TN", URL: artwork}
+			// The artwork MIME comes from the backend rather than being assumed.
+			// A poster.png was advertised as image/jpeg, so the declared <res>
+			// contradicted the bytes actually served.
+			artMime := o.ArtworkMime
+			if artMime == "" {
+				artMime = "image/jpeg"
+			}
+			// JPEG_TN is defined as at most 160x160. Generated thumbnails default
+			// to 320 wide and a sidecar poster can be any size, so claiming that
+			// profile was simply untrue; JPEG_SM covers up to 640x480 and real
+			// posters are advertised without a profile at all.
+			profile := artworkProfile(artMime)
+			item.AlbumArt = &didlAlbumArt{ProfileID: profile, URL: artwork}
+
+			protocol := "http-get:*:" + artMime + ":"
+			if profile != "" {
+				protocol += "DLNA.ORG_PN=" + profile + ";"
+			}
 			item.Res = append(item.Res, didlRes{
-				ProtocolInfo: "http-get:*:image/jpeg:DLNA.ORG_PN=JPEG_TN",
+				ProtocolInfo: protocol + content.ContentFeatures(artMime),
 				URL:          artwork,
 			})
 		}

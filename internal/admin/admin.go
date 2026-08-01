@@ -6,7 +6,9 @@ import (
 	"embed"
 	"encoding/json"
 	"log/slog"
+	"mime"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -26,6 +28,7 @@ type Status struct {
 	LibrarySize       int      `json:"librarySize"`
 	Folders           []Folder `json:"folders"`
 	WatcherActive     bool     `json:"watcherActive"`
+	WatcherDegraded   bool     `json:"watcherDegraded"` // some dirs unwatched (inotify limit)
 	FFprobe           bool     `json:"ffprobe"`
 	FFmpeg            bool     `json:"ffmpeg"`
 	ReconcileInterval string   `json:"reconcileInterval"`
@@ -55,12 +58,62 @@ func New(ctrl Controller, log *slog.Logger) *Handler {
 	h := &Handler{ctrl: ctrl, log: log, mux: http.NewServeMux()}
 	h.mux.HandleFunc("GET /{$}", h.serveIndex)
 	h.mux.HandleFunc("GET /admin/api/status", h.getStatus)
-	h.mux.HandleFunc("POST /admin/api/rescan", h.postRescan)
+	h.mux.HandleFunc("POST /admin/api/rescan", guard(h.postRescan))
 	h.mux.HandleFunc("GET /admin/api/folders", h.getFolders)
-	h.mux.HandleFunc("POST /admin/api/folders", h.postFolder)
-	h.mux.HandleFunc("DELETE /admin/api/folders", h.deleteFolder)
+	h.mux.HandleFunc("POST /admin/api/folders", guard(h.postFolder))
+	h.mux.HandleFunc("DELETE /admin/api/folders", guard(h.deleteFolder))
 	h.mux.HandleFunc("GET /admin/api/logs", h.getLogs)
 	return h
+}
+
+// guard protects a mutating endpoint against cross-site requests.
+//
+// The dashboard has no authentication by design (trusted LAN), but that made
+// every write endpoint reachable from any web page a LAN user happened to visit:
+// an HTML form posting `text/plain` is a CORS "simple request", so it is sent
+// without a preflight and the browser attaches no protection. Requiring JSON and
+// a same-origin Origin/Referer reduces these to requests the dashboard itself
+// makes; both checks are ones a cross-origin form cannot satisfy.
+func guard(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !sameOrigin(r) {
+			writeError(w, http.StatusForbidden,
+				"cross-origin request refused; use the Beacon dashboard on this host")
+			return
+		}
+		// A body-bearing request must be JSON, which a simple form cannot send.
+		if r.ContentLength != 0 || r.Header.Get("Content-Type") != "" {
+			ct, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil || ct != "application/json" {
+				writeError(w, http.StatusUnsupportedMediaType,
+					"Content-Type must be application/json")
+				return
+			}
+		}
+		next(w, r)
+	}
+}
+
+// sameOrigin reports whether a mutating request came from the dashboard itself.
+// A request with neither Origin nor Referer is allowed: browsers always send at
+// least one on cross-origin requests, while curl and the like send neither.
+func sameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		if ref := r.Header.Get("Referer"); ref != "" {
+			u, err := url.Parse(ref)
+			if err != nil {
+				return false
+			}
+			return u.Host == r.Host
+		}
+		return true // not a browser-initiated cross-site request
+	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return u.Host == r.Host
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }

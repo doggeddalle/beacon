@@ -44,7 +44,9 @@ and rebuilt.
 
 - A Linux host (the target NAS). `ffmpeg` and `ffprobe` on `PATH` enable
   metadata and thumbnails; without them, browsing/streaming/subtitles still work.
-- To build: **Go 1.23+**.
+- To build: **Go 1.25+** (see the `go` directive in `go.mod`).
+
+IPv4 only — there is no IPv6 support.
 
 ## Install as an ADM app (ASUSTOR App Central)
 
@@ -52,8 +54,16 @@ Build the package (produces `dist/Beacon_<version>_arm64.apk` — ASUSTOR calls
 these "APK files"; the format is APKG 2.0):
 
 ```powershell
-./scripts/package.ps1 -Version 0.7.2
+./scripts/package.ps1
 ```
+
+Or, on any platform (Linux, macOS, or Git Bash on Windows):
+
+```bash
+./scripts/build.sh
+```
+
+Both read the version from the `VERSION` file.
 
 On the NAS:
 
@@ -104,8 +114,39 @@ Browse to `http://<nas-ip>:8322/`:
 - trigger a rescan,
 - view recent log lines.
 
-It shares the media-server port and has no authentication — intended for a
-trusted LAN.
+It shares the media-server port and has **no authentication** — intended for a
+trusted LAN. Two limits keep that from being a blank cheque:
+
+- Write endpoints refuse cross-origin requests and require `application/json`,
+  so a web page you happen to visit cannot drive the dashboard behind your back.
+- Folders can only be added under `library.allowed_parents` (defaulting to the
+  parents of the folders you already configured), so nobody can point Beacon at
+  `/` and stream the whole NAS.
+
+Anyone on the LAN can still *read* status and recent log lines.
+
+## Troubleshooting
+
+**A TV can't find the server.** Discovery is SSDP on UDP/1900:
+
+- Something else may hold port 1900 (the NAS's own media server). Beacon logs
+  this and keeps serving over HTTP — only auto-discovery is lost. Stop the other
+  server, or point the client at `http://<nas-ip>:8322/rootDesc.xml` directly.
+- Beacon joins the multicast group on *every* up, multicast-capable interface and
+  replies with the address of the one the query arrived on, so link aggregation,
+  VLANs and Docker bridges are handled. Set `[server] interface` to pin it to one.
+- After a DHCP address change Beacon re-announces with a new `BOOTID`, which tells
+  clients to discard the address they cached. Some TVs still need their media-source
+  list refreshed.
+
+**The port conflicts.** `http_port = 0` picks any free port.
+
+**Where are the logs?** The ADM package writes `beacon.log` next to the binary in
+`/usr/local/AppCentral/Beacon/`. It is truncated at each start and is not rotated,
+so avoid leaving `log.level = "debug"` on permanently.
+
+**Durations and resolutions are blank.** `ffprobe` was not found at index time.
+Install it and restart — items whose probe failed are automatically re-queued.
 
 ## Building & testing
 
@@ -153,10 +194,14 @@ NAS is never overwhelmed. See the package doc comments for details.
 
 ## Roadmap (optional)
 
-- Per-client (Samsung/LG/Sony) quirk profiles.
 - GENA push eventing so clients refresh a folder on their own, rather than on
-  re-navigation.
+  re-navigation. `SystemUpdateID` is maintained correctly today, but there is no
+  subscription mechanism to tell anyone about it.
+- ContentDirectory `Search`, for Samsung's "Recently added" and Kodi/BubbleUPnP
+  search boxes.
+- Per-client (Samsung/LG/Sony) quirk profiles.
 - Optional dashboard authentication.
+- IPv6.
 
 ## License
 

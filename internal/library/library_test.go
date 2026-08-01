@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"beacon/internal/content"
@@ -58,7 +59,7 @@ func TestBrowseFromIndex(t *testing.T) {
 	_, _, be, _ := setup(t)
 
 	// Root -> one "Movies" container.
-	rootKids, err := be.Children(content.RootID)
+	rootKids, _, err := be.Children(content.RootID, content.Page{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +71,7 @@ func TestBrowseFromIndex(t *testing.T) {
 	}
 
 	// Into Movies: Action (container, sorts first) + Top (item).
-	kids, err := be.Children(rootKids[0].ID)
+	kids, _, err := be.Children(rootKids[0].ID, content.Page{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,8 +152,8 @@ func TestRescanIsNonDestructiveAndPrunes(t *testing.T) {
 	}
 
 	// Browsing reflects the new state.
-	root, _ := be.Children(content.RootID)
-	kids, _ := be.Children(root[0].ID)
+	root, _, _ := be.Children(content.RootID, content.Page{})
+	kids, _, _ := be.Children(root[0].ID, content.Page{})
 	var titles []string
 	for _, k := range kids {
 		titles = append(titles, k.Title)
@@ -160,5 +161,81 @@ func TestRescanIsNonDestructiveAndPrunes(t *testing.T) {
 	// Expect: Action (container), New (item). Top removed.
 	if len(kids) != 2 {
 		t.Fatalf("after rescan Movies has %d children %v, want 2 (Action, New)", len(kids), titles)
+	}
+}
+
+// A scan interrupted part-way must never prune. Otherwise a SIGTERM during the
+// initial scan — or a network mount dropping mid-walk — deletes every row the walk
+// had not reached yet, wiping the library.
+//
+// The cancellation has to land *during* the walk: FullScan checks ctx before each
+// root, so cancelling up front just skips the root and proves nothing.
+func TestScanCancelledMidWalkDoesNotPrune(t *testing.T) {
+	st, ix, _, _ := setup(t)
+
+	before, err := st.Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == 0 {
+		t.Fatal("setup indexed nothing")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Cancel once the walk is underway, leaving most rows carrying the previous
+	// generation — exactly the state that made the old code delete them.
+	visited := 0
+	ix.onVisit = func(string) {
+		visited++
+		if visited == 2 {
+			cancel()
+		}
+	}
+	_ = ix.FullScan(ctx)
+
+	if visited < 2 {
+		t.Fatalf("walk visited %d entries, expected the cancel hook to fire", visited)
+	}
+	after, err := st.Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("scan cancelled mid-walk pruned the index: %d rows -> %d rows", before, after)
+	}
+}
+
+// Same guard, non-cancellation path: a directory the walk cannot descend into
+// hides an unknown number of live files, so pruning would delete them.
+func TestUnreadableDirDoesNotPrune(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod-based permission removal is not meaningful on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("running as root — permission bits are not enforced")
+	}
+	st, ix, _, movies := setup(t)
+
+	before, err := st.Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	action := filepath.Join(movies, "Action")
+	if err := os.Chmod(action, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(action, 0o755) })
+
+	_ = ix.FullScan(context.Background())
+
+	after, err := st.Count()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("scan with an unreadable directory pruned the index: %d rows -> %d rows", before, after)
 	}
 }

@@ -112,12 +112,16 @@ func (p *Prober) Probe(ctx context.Context, file string) (Info, error) {
 }
 
 // DurationHMS formats the duration as H:MM:SS for the DLNA res@duration
-// attribute. Returns "" when unknown.
+// attribute. Returns "" when unknown or shorter than a second.
+//
+// The sub-second case matters for still images: ffprobe reports a nominal frame
+// duration (~0.04s) for a PNG or JPEG, which used to render as "0:00:00" and be
+// advertised on photo items, where a duration is meaningless.
 func (i Info) DurationHMS() string {
-	if i.DurationSecs <= 0 {
+	total := int(i.DurationSecs + 0.5)
+	if i.DurationSecs <= 0 || total == 0 {
 		return ""
 	}
-	total := int(i.DurationSecs + 0.5)
 	return fmt.Sprintf("%d:%02d:%02d", total/3600, (total%3600)/60, total%60)
 }
 

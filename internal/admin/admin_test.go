@@ -81,6 +81,126 @@ func TestRescanAndFolders(t *testing.T) {
 	resp.Body.Close()
 }
 
+// The dashboard is deliberately unauthenticated, so cross-site requests are the
+// whole attack surface. A form posting text/plain is a CORS "simple request":
+// no preflight, sent by any page a LAN user visits. Both write endpoints must
+// refuse it.
+func TestCrossOriginWritesAreRefused(t *testing.T) {
+	c := &fakeCtrl{}
+	srv := newTestServer(c)
+	defer srv.Close()
+
+	cases := []struct {
+		name        string
+		method, url string
+		ctype, body string
+		origin      string
+		referer     string
+		wantStatus  int
+	}{
+		{
+			name: "cross-origin text/plain form post", method: "POST",
+			url: "/admin/api/folders", ctype: "text/plain", body: `{"path":"/"}`,
+			origin: "http://evil.example", wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "cross-origin rescan", method: "POST", url: "/admin/api/rescan",
+			origin: "http://evil.example", wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "cross-origin delete", method: "DELETE", url: "/admin/api/folders?path=/m",
+			origin: "http://evil.example", wantStatus: http.StatusForbidden,
+		},
+		{
+			name: "cross-origin via referer", method: "POST", url: "/admin/api/rescan",
+			referer: "http://evil.example/page", wantStatus: http.StatusForbidden,
+		},
+		{
+			// Same-origin but not JSON: still not something the dashboard sends.
+			name: "same-origin text/plain body", method: "POST",
+			url: "/admin/api/folders", ctype: "text/plain", body: `{"path":"/"}`,
+			wantStatus: http.StatusUnsupportedMediaType,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body io.Reader
+			if tc.body != "" {
+				body = strings.NewReader(tc.body)
+			}
+			req, err := http.NewRequest(tc.method, srv.URL+tc.url, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.ctype != "" {
+				req.Header.Set("Content-Type", tc.ctype)
+			}
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			if tc.referer != "" {
+				req.Header.Set("Referer", tc.referer)
+			}
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+			}
+		})
+	}
+
+	if len(c.added) != 0 {
+		t.Errorf("a cross-site request reached AddFolder: %+v", c.added)
+	}
+	if c.rescans != 0 {
+		t.Errorf("a cross-site request triggered %d rescans", c.rescans)
+	}
+	if len(c.removed) != 0 {
+		t.Errorf("a cross-site request reached RemoveFolder: %+v", c.removed)
+	}
+}
+
+// The dashboard's own requests must keep working: same-origin JSON for the one
+// call with a body, and no Content-Type at all for the bodyless ones.
+func TestSameOriginWritesStillWork(t *testing.T) {
+	c := &fakeCtrl{}
+	srv := newTestServer(c)
+	defer srv.Close()
+	host := strings.TrimPrefix(srv.URL, "http://")
+
+	post := func(url, ctype, body string) int {
+		var r io.Reader
+		if body != "" {
+			r = strings.NewReader(body)
+		}
+		req, _ := http.NewRequest("POST", srv.URL+url, r)
+		if ctype != "" {
+			req.Header.Set("Content-Type", ctype)
+		}
+		req.Header.Set("Origin", "http://"+host) // what a browser sends
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	if got := post("/admin/api/rescan", "", ""); got != http.StatusOK {
+		t.Errorf("same-origin rescan = %d, want 200", got)
+	}
+	if got := post("/admin/api/folders", "application/json", `{"name":"M","path":"/m"}`); got != http.StatusOK {
+		t.Errorf("same-origin add folder = %d, want 200", got)
+	}
+	if c.rescans != 1 || len(c.added) != 1 {
+		t.Errorf("dashboard requests did not reach the controller: rescans=%d added=%+v", c.rescans, c.added)
+	}
+}
+
 func getBody(t *testing.T, url string) string {
 	t.Helper()
 	resp, err := http.Get(url)

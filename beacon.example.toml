@@ -12,7 +12,15 @@ http_port = 8322           # media, SOAP control and the admin dashboard
                            #  use 0 to auto-pick any free port)
 data_dir = "./data"        # SQLite DB, thumbnails and other state
 
+[library]
+# Directories the web dashboard is allowed to add to the library. The dashboard
+# has no authentication, so this stops anyone on the LAN adding "/" and streaming
+# the whole NAS. Empty = the parent directories of the folders configured below,
+# which is usually what you want.
+# allowed_parents = ["/volume1"]
+
 # Add one block per media source. Repeat [[library.folders]] as needed.
+# Names must be unique — stale-entry pruning is keyed on them.
 [[library.folders]]
 name = "Movies"
 path = "/volume1/kodi/movies"

@@ -2,12 +2,14 @@ package library
 
 import (
 	"context"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
@@ -33,17 +35,38 @@ type Watcher struct {
 	settleDelay time.Duration
 	log         *slog.Logger
 	onChange    func()
+	onDesync    func()
 
 	fsw    *fsnotify.Watcher
 	mu     sync.Mutex
 	timers map[string]*time.Timer
+
+	// watched tracks the directories we hold inotify watches on, so a removed or
+	// renamed directory can have its descendants' watches released too — fsnotify
+	// only ever removes the exact path it is given.
+	wmu     sync.Mutex
+	watched map[string]bool
+
+	// trees carries whole-directory indexing off the event loop; doing that work
+	// inline lets the kernel's inotify queue overflow while we walk.
+	trees chan string
+
+	degraded atomic.Bool // inotify coverage is incomplete (watch limit hit)
 }
 
+// treeQueueDepth bounds the backlog of directories awaiting a subtree index. If
+// it fills we ask for a reconcile rather than blocking the event loop.
+const treeQueueDepth = 64
+
 // NewWatcher creates a watcher. onChange is invoked after any applied change
-// (used to bump the ContentDirectory update ID); it may be nil.
-func NewWatcher(st *store.Store, roots []Root, settleDelay time.Duration, log *slog.Logger, onChange func()) *Watcher {
+// (used to bump the ContentDirectory update ID); onDesync is invoked when events
+// were provably lost and only a rescan can restore accuracy. Both may be nil.
+func NewWatcher(st *store.Store, roots []Root, settleDelay time.Duration, log *slog.Logger, onChange, onDesync func()) *Watcher {
 	if onChange == nil {
 		onChange = func() {}
+	}
+	if onDesync == nil {
+		onDesync = func() {}
 	}
 	if settleDelay <= 0 {
 		settleDelay = 2 * time.Second
@@ -57,9 +80,14 @@ func NewWatcher(st *store.Store, roots []Root, settleDelay time.Duration, log *s
 	}
 	return &Watcher{
 		store: st, roots: abs, settleDelay: settleDelay, log: log,
-		onChange: onChange, timers: map[string]*time.Timer{},
+		onChange: onChange, onDesync: onDesync, timers: map[string]*time.Timer{},
+		watched: map[string]bool{}, trees: make(chan string, treeQueueDepth),
 	}
 }
+
+// Degraded reports whether inotify coverage is incomplete, so the dashboard can
+// say so rather than implying real-time updates are working everywhere.
+func (w *Watcher) Degraded() bool { return w.degraded.Load() }
 
 // Run starts watching and blocks until ctx is cancelled.
 func (w *Watcher) Run(ctx context.Context) error {
@@ -69,12 +97,35 @@ func (w *Watcher) Run(ctx context.Context) error {
 	}
 	w.fsw = fsw
 	defer fsw.Close()
+	// Settle timers outlive the event loop otherwise, firing after the server has
+	// closed the database and logging a burst of failed writes on every shutdown.
+	defer w.stopAllTimers()
 
-	watched := 0
+	watched, failed := 0, 0
 	for _, r := range w.roots {
-		watched += w.addWatchesRecursive(r.Path)
+		n, f := w.addWatchesRecursive(r.Path)
+		watched += n
+		failed += f
 	}
+	w.reportWatchFailures(failed)
 	w.log.Info("watcher active (tier 1: real-time)", "roots", len(w.roots), "directories_watched", watched)
+
+	// Subtree indexing runs here so a folder dropped in with 10k files does not
+	// stall event draining while we walk it.
+	treesDone := make(chan struct{})
+	go func() {
+		defer close(treesDone)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case dir := <-w.trees:
+				w.indexTree(dir)
+				w.onChange()
+			}
+		}
+	}()
+	defer func() { <-treesDone }()
 
 	for {
 		select {
@@ -89,8 +140,25 @@ func (w *Watcher) Run(ctx context.Context) error {
 			if !ok {
 				return nil
 			}
+			// Overflow is not a diagnostic — it means the kernel discarded events
+			// and the index is now silently wrong. Only a rescan can fix that.
+			if errors.Is(err, fsnotify.ErrEventOverflow) {
+				w.log.Warn("inotify queue overflowed — events were lost, triggering a reconcile scan")
+				w.onDesync()
+				continue
+			}
 			w.log.Warn("watcher error", "err", err)
 		}
+	}
+}
+
+// stopAllTimers cancels every pending settle timer.
+func (w *Watcher) stopAllTimers() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for path, t := range w.timers {
+		t.Stop()
+		delete(w.timers, path)
 	}
 }
 
@@ -105,9 +173,16 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 		if fi.IsDir() {
 			// New directory: index it and everything already inside, and start
 			// watching it (files may have been dropped in as a whole folder).
-			w.indexTree(ev.Name)
-			w.log.Info("indexed new folder", "path", ev.Name, "library_size", w.size())
-			w.onChange()
+			// Queued, not inline — see the trees channel.
+			w.log.Info("indexing new folder", "path", ev.Name)
+			select {
+			case w.trees <- ev.Name:
+			default:
+				// Backlog full: folders are arriving faster than we can walk them.
+				// A reconcile will pick up whatever we drop here.
+				w.log.Warn("subtree index backlog full — deferring to a reconcile scan", "path", ev.Name)
+				w.onDesync()
+			}
 		} else {
 			w.scheduleIndex(ev.Name)
 		}
@@ -119,9 +194,9 @@ func (w *Watcher) handleEvent(ev fsnotify.Event) {
 		// Removed or moved away: drop it (and any descendants) from the index.
 		w.cancelTimer(ev.Name)
 		n, err := w.store.DeleteSubtree(ev.Name)
-		_ = w.fsw.Remove(ev.Name) // no-op if it wasn't a watched dir
+		w.unwatchSubtree(ev.Name)
 		if err == nil && n > 0 {
-			w.log.Info("removed from library", "path", ev.Name, "rows", n, "library_size", w.size())
+			w.log.Info("removed from library", "path", ev.Name, "rows", n)
 			w.onChange()
 		}
 	}
@@ -168,15 +243,9 @@ func (w *Watcher) indexFile(path string) {
 		return
 	}
 	if w.indexFileInfo(path, fi) {
-		w.log.Info("indexed change", "path", path, "library_size", w.size())
+		w.log.Info("indexed change", "path", path)
 		w.onChange()
 	}
-}
-
-// size returns the current indexed item count (best-effort, for logging).
-func (w *Watcher) size() int {
-	n, _ := w.store.Count()
-	return n
 }
 
 // indexFileInfo upserts a media file. Returns true if it was a media file (and
@@ -225,6 +294,7 @@ func (w *Watcher) indexDir(path string, fi os.FileInfo) {
 // indexTree indexes a directory and everything under it, adding watches for
 // every directory encountered. Used when a whole folder appears at once.
 func (w *Watcher) indexTree(dir string) {
+	failed := 0
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -242,21 +312,21 @@ func (w *Watcher) indexTree(dir string) {
 		}
 		if d.IsDir() {
 			w.indexDir(p, fi)
-			if err := w.fsw.Add(p); err != nil {
-				w.warnWatchLimit(p, err)
+			if !w.addWatch(p) {
+				failed++
 			}
 			return nil
 		}
 		w.indexFileInfo(p, fi)
 		return nil
 	})
+	w.reportWatchFailures(failed)
 }
 
 // addWatchesRecursive adds inotify watches for dir and all subdirectories,
-// returning the count added. It does not index (the initial full scan already
-// did). Used once at startup.
-func (w *Watcher) addWatchesRecursive(dir string) int {
-	n := 0
+// returning how many succeeded and how many failed. It does not index (the
+// initial full scan already did). Used once at startup.
+func (w *Watcher) addWatchesRecursive(dir string) (added, failed int) {
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return nil
@@ -267,14 +337,67 @@ func (w *Watcher) addWatchesRecursive(dir string) int {
 		if p != dir && strings.HasPrefix(d.Name(), ".") {
 			return filepath.SkipDir
 		}
-		if err := w.fsw.Add(p); err != nil {
-			w.warnWatchLimit(p, err)
-			return nil
+		if w.addWatch(p) {
+			added++
+		} else {
+			failed++
 		}
-		n++
 		return nil
 	})
-	return n
+	return added, failed
+}
+
+// addWatch registers an inotify watch and records it, so the descendants of a
+// removed directory can be released later.
+func (w *Watcher) addWatch(dir string) bool {
+	if err := w.fsw.Add(dir); err != nil {
+		w.log.Debug("could not watch directory", "path", dir, "err", err)
+		return false
+	}
+	w.wmu.Lock()
+	w.watched[dir] = true
+	w.wmu.Unlock()
+	return true
+}
+
+// unwatchSubtree releases the watch on dir and on every directory beneath it.
+//
+// fsnotify.Remove only drops the exact path, so renaming a folder used to strand
+// its children's watch descriptors: later events inside the renamed tree arrived
+// under the old, non-existent path and were silently discarded.
+func (w *Watcher) unwatchSubtree(dir string) {
+	prefix := dir + string(os.PathSeparator)
+	w.wmu.Lock()
+	var gone []string
+	for p := range w.watched {
+		if p == dir || strings.HasPrefix(p, prefix) {
+			gone = append(gone, p)
+		}
+	}
+	for _, p := range gone {
+		delete(w.watched, p)
+	}
+	w.wmu.Unlock()
+
+	for _, p := range gone {
+		_ = w.fsw.Remove(p)
+	}
+	if len(gone) == 0 {
+		_ = w.fsw.Remove(dir) // not tracked (e.g. a file); harmless no-op
+	}
+}
+
+// reportWatchFailures logs one summary line per batch. Logging per directory
+// turned a blown fs.inotify.max_user_watches into thousands of identical lines,
+// flooding the dashboard's 300-line ring and hiding everything else.
+func (w *Watcher) reportWatchFailures(failed int) {
+	if failed == 0 {
+		return
+	}
+	w.degraded.Store(true)
+	w.log.Warn("some directories could not be watched — real-time updates are incomplete there; "+
+		"the Tier-2 reconcile scan still catches changes. Consider raising fs.inotify.max_user_watches",
+		"directories", failed)
 }
 
 // rootFor returns the configured root that owns path.
@@ -285,10 +408,4 @@ func (w *Watcher) rootFor(path string) (Root, bool) {
 		}
 	}
 	return Root{}, false
-}
-
-func (w *Watcher) warnWatchLimit(path string, err error) {
-	w.log.Warn("could not watch directory — the Tier-2 reconcile scan will still catch changes here; "+
-		"consider raising fs.inotify.max_user_watches",
-		"path", path, "err", err)
 }
