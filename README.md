@@ -207,4 +207,4 @@ NAS is never overwhelmed. See the package doc comments for details.
 
 Licensed under the Apache License, Version 2.0 — see [`LICENSE`](LICENSE).
 
-Copyright 2026 doggeddalle
+Copyright 2026 cicalooo
