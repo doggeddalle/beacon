@@ -120,8 +120,9 @@ trusted LAN. Two limits keep that from being a blank cheque:
 - Write endpoints refuse cross-origin requests and require `application/json`,
   so a web page you happen to visit cannot drive the dashboard behind your back.
 - Folders can only be added under `library.allowed_parents` (defaulting to the
-  parents of the folders you already configured), so nobody can point Beacon at
-  `/` and stream the whole NAS.
+  standard ASUSTOR mounts `/volume1` and `/volume2`), so paths such as
+  `/volume1/kodi/movies` and `/volume2/kodi2/mix` work while nobody can point
+  Beacon at `/` and stream the whole NAS.
 
 Anyone on the LAN can still *read* status and recent log lines.
 

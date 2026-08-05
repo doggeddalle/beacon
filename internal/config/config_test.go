@@ -22,6 +22,11 @@ func TestLoadCreatesFileWithDefaultsAndUUID(t *testing.T) {
 	if cfg.Server.HTTPPort != 8322 {
 		t.Errorf("HTTPPort = %d, want 8322", cfg.Server.HTTPPort)
 	}
+	wantVolume1, _ := filepath.Abs("/volume1")
+	wantVolume2, _ := filepath.Abs("/volume2")
+	if got := cfg.Library.AllowedParents; len(got) != 2 || got[0] != wantVolume1 || got[1] != wantVolume2 {
+		t.Errorf("AllowedParents = %q, want /volume1 and /volume2", got)
+	}
 	if len(cfg.Server.UUID) != 36 {
 		t.Errorf("UUID = %q, want a 36-char v4 UUID", cfg.Server.UUID)
 	}
@@ -169,6 +174,7 @@ func TestPathAllowedConfinesDashboardAdds(t *testing.T) {
 
 	t.Run("defaults to the parents of configured folders", func(t *testing.T) {
 		c := Defaults()
+		c.Library.AllowedParents = nil
 		c.Library.Folders = []Folder{{Name: "Movies", Path: abs("/media/movies")}}
 
 		if !c.PathAllowed(abs("/media/shows")) {
@@ -198,10 +204,19 @@ func TestPathAllowedConfinesDashboardAdds(t *testing.T) {
 		}
 	})
 
-	t.Run("nothing configured allows nothing", func(t *testing.T) {
+	t.Run("default NAS volumes are allowed", func(t *testing.T) {
 		c := Defaults()
-		if c.PathAllowed(abs("/media")) {
-			t.Error("with no folders and no allow-list, nothing should be addable")
+		for i, p := range c.Library.AllowedParents {
+			c.Library.AllowedParents[i] = abs(p)
+		}
+		if !c.PathAllowed(abs("/volume1/kodi/movies")) {
+			t.Error("a folder under /volume1 should be addable on a fresh install")
+		}
+		if !c.PathAllowed(abs("/volume2/kodi2/mix")) {
+			t.Error("a folder under /volume2 should be addable on a fresh install")
+		}
+		if c.PathAllowed(abs("/etc")) {
+			t.Error("a path outside the NAS media volumes must be refused")
 		}
 	})
 }

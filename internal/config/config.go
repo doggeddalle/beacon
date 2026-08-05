@@ -112,6 +112,12 @@ func Defaults() Config {
 			HTTPPort: 8322,
 			DataDir:  "./data",
 		},
+		Library: LibraryConfig{
+			// ASUSTOR exposes storage volumes at these absolute mount points. Keep
+			// the dashboard confined to media volumes while allowing a fresh
+			// install to add folders before any library roots exist.
+			AllowedParents: []string{"/volume1", "/volume2"},
+		},
 		Index: IndexConfig{
 			Workers:           2,
 			ReconcileInterval: Duration(15 * time.Minute),
